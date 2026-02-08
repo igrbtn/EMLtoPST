@@ -1,0 +1,16 @@
+From: John Doe <john@example.com>
+To: Jane Smith <jane@example.com>
+Cc: Bob Wilson <bob@example.com>
+Subject: Meeting Tomorrow
+Date: Thu, 06 Feb 2025 10:30:00 -0500
+Message-ID: <msg001@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+
+Hi Jane,
+
+Just a reminder about our meeting tomorrow at 2 PM.
+Please bring the Q4 reports.
+
+Thanks,
+John

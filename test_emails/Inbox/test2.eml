@@ -1,0 +1,32 @@
+From: Alice Brown <alice@example.com>
+To: Jane Smith <jane@example.com>
+Subject: Project Update
+Date: Wed, 05 Feb 2025 14:00:00 -0500
+Message-ID: <msg002@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="boundary123"
+
+--boundary123
+Content-Type: text/html; charset="utf-8"
+
+<html>
+<body>
+<h1>Project Status</h1>
+<p>The project is on track. Here are the key updates:</p>
+<ul>
+<li>Phase 1 complete</li>
+<li>Phase 2 in progress</li>
+</ul>
+</body>
+</html>
+
+--boundary123
+Content-Type: text/plain; charset="utf-8"
+Content-Disposition: attachment; filename="notes.txt"
+
+These are some attached notes for the project.
+Phase 1: Done
+Phase 2: In Progress
+Phase 3: Planned
+
+--boundary123--
