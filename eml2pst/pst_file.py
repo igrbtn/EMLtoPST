@@ -9,7 +9,8 @@ from pathlib import Path
 
 from .crc import compute_crc
 from .ndb.header import build_header, pack_root, HEADER_SIZE
-from .ndb.block import pack_block, block_total_size
+from .ndb.block import pack_block, block_total_size, MAX_BLOCK_DATA
+from .ndb.xblock import build_xblock
 from .ndb.btree import (
     build_btree_pages, pack_nbt_entry, pack_bbt_entry,
     PTTYPE_NBT, PTTYPE_BBT, PAGE_SIZE,
@@ -24,6 +25,7 @@ from .messaging.folder import (
 )
 from .messaging.message import (
     build_message_pc, build_recipients_tc, build_attachments_tc,
+    build_attachment_pc, attachment_subnode_nid,
     message_nid_recipients, message_nid_attachments,
 )
 from .mapi.properties import (
@@ -109,11 +111,62 @@ class PSTFileBuilder:
         self._data_blocks.append((bid, data))
         return bid
 
-    def _add_node(self, nid, data, sub_bid=0, parent_nid=0):
-        """Add a node with its data block."""
-        bid = self._store_data_block(data)
-        self._nodes.append((nid, bid, sub_bid, parent_nid))
-        return bid
+    def _store_node_pages(self, pages):
+        """Store HN pages. Single page -> leaf BID, multi-page -> XBLOCK internal BID."""
+        if len(pages) == 1:
+            return self._store_data_block(pages[0])
+        bids = []
+        total = 0
+        for page in pages:
+            bids.append(self._store_data_block(page))
+            total += len(page)
+        return self._store_internal_block(build_xblock(bids, total))
+
+    def _store_subnode_data(self, data):
+        """Store subnode data. Small -> leaf BID, large -> chunked + XBLOCK internal BID."""
+        if len(data) <= MAX_BLOCK_DATA:
+            return self._store_data_block(data)
+        bids = []
+        for i in range(0, len(data), MAX_BLOCK_DATA):
+            bids.append(self._store_data_block(data[i:i + MAX_BLOCK_DATA]))
+        return self._store_internal_block(build_xblock(bids, len(data)))
+
+    def _build_sl_bid(self, sl_entries):
+        """Build SLBLOCK from entries and return internal BID, or 0 if empty."""
+        if not sl_entries:
+            return 0
+        return self._store_internal_block(build_sl_block(sl_entries))
+
+    def _store_tc_or_pc(self, pages, subnodes):
+        """Store a PC or TC node's pages and subnodes, return (data_bid, sub_bid)."""
+        data_bid = self._store_node_pages(pages)
+        sub_bid = 0
+        if subnodes:
+            sl = [(sn, self._store_subnode_data(sd), 0) for sn, sd in subnodes]
+            sub_bid = self._build_sl_bid(sl)
+        return data_bid, sub_bid
+
+    def _add_node(self, nid, pages, subnodes=None, extra_sl_entries=None, parent_nid=0):
+        """Add a node with its HN pages and optional subnodes.
+
+        Args:
+            nid: Node ID.
+            pages: List of bytes (HN pages from build_pc_node/build_tc_node).
+            subnodes: List of (nid, data_bytes) for large values.
+            extra_sl_entries: Additional (nid, bid_data, bid_sub) SL entries.
+            parent_nid: Parent node ID.
+        """
+        data_bid = self._store_node_pages(pages)
+
+        sl_entries = list(extra_sl_entries or [])
+        if subnodes:
+            for sub_nid, sub_data in subnodes:
+                sub_bid = self._store_subnode_data(sub_data)
+                sl_entries.append((sub_nid, sub_bid, 0))
+
+        sub_bid = self._build_sl_bid(sl_entries)
+        self._nodes.append((nid, data_bid, sub_bid, parent_nid))
+        return data_bid
 
     def add_folder(self, name, parent_nid=None):
         """Add a folder to the PST.
@@ -161,49 +214,46 @@ class PSTFileBuilder:
         # Store parsed EML for Contents TC row building
         self._messages[msg_nid] = parsed_eml
 
-        # Build message PC data
-        msg_data = build_message_pc(parsed_eml)
+        # Build message PC (returns (pages, subnodes))
+        msg_pages, msg_subnodes = build_message_pc(parsed_eml)
 
-        # Build subnodes (recipients TC, attachments TC) as SLBLOCK
-        sl_entries = []
+        # Build SL entries for recipients/attachments TCs
+        extra_sl = []
 
         if parsed_eml.get('recipients'):
-            recip_data = build_recipients_tc(parsed_eml['recipients'])
-            recip_bid = self._store_data_block(recip_data)
+            recip_pages, recip_subnodes = build_recipients_tc(parsed_eml['recipients'])
+            recip_bid, recip_sub_bid = self._store_tc_or_pc(recip_pages, recip_subnodes)
             recip_nid = message_nid_recipients(msg_nid)
-            sl_entries.append((recip_nid, recip_bid, 0))
+            extra_sl.append((recip_nid, recip_bid, recip_sub_bid))
 
         if parsed_eml.get('attachments'):
-            attach_data = build_attachments_tc(parsed_eml['attachments'])
-            attach_bid = self._store_data_block(attach_data)
+            attach_pages, attach_subnodes = build_attachments_tc(parsed_eml['attachments'])
+            attach_bid, attach_sub_bid = self._store_tc_or_pc(attach_pages, attach_subnodes)
             attach_nid = message_nid_attachments(msg_nid)
-            sl_entries.append((attach_nid, attach_bid, 0))
+            extra_sl.append((attach_nid, attach_bid, attach_sub_bid))
 
-            # Store attachment data as separate blocks
-            for att in parsed_eml['attachments']:
-                if att.get('data'):
-                    self._store_data_block(att['data'])
+            # Per [MS-PST] 2.4.6.2: each attachment gets its own subnode PC
+            for i, att in enumerate(parsed_eml['attachments']):
+                att_pages, att_subnodes = build_attachment_pc(att, i)
+                att_bid, att_sub_bid = self._store_tc_or_pc(att_pages, att_subnodes)
+                att_nid = attachment_subnode_nid(i)
+                extra_sl.append((att_nid, att_bid, att_sub_bid))
 
-        # Create SLBLOCK if there are subnodes (must use internal BID)
-        sub_bid = 0
-        if sl_entries:
-            sl_data = build_sl_block(sl_entries)
-            sub_bid = self._store_internal_block(sl_data)
-
-        # Add message node with bidSub pointing to SLBLOCK
-        self._add_node(msg_nid, msg_data, sub_bid=sub_bid, parent_nid=folder_nid)
+        # Add message node with PC pages, subnodes, and extra SL entries
+        self._add_node(msg_nid, msg_pages, msg_subnodes,
+                       extra_sl_entries=extra_sl, parent_nid=folder_nid)
 
         return msg_nid
 
     def _build_internal_nodes(self):
         """Build the required internal nodes (store, root folder, name map)."""
         # 1. Message Store (NID 0x21)
-        store_data, self._record_key = build_message_store(self.display_name)
-        self._add_node(NID_MESSAGE_STORE, store_data)
+        (store_pages, store_subnodes), self._record_key = build_message_store(self.display_name)
+        self._add_node(NID_MESSAGE_STORE, store_pages, store_subnodes)
 
         # 2. Name-to-ID Map (NID 0x61) — required structure with GUID/entry/string streams
-        namemap_data = build_name_to_id_map()
-        self._add_node(NID_NAME_TO_ID_MAP, namemap_data)
+        namemap_pages, namemap_subnodes = build_name_to_id_map()
+        self._add_node(NID_NAME_TO_ID_MAP, namemap_pages, namemap_subnodes)
 
     def _build_folder_nodes(self):
         """Build all folder nodes (PC + 3 TCs as separate top-level NBT entries)."""
@@ -211,8 +261,8 @@ class PSTFileBuilder:
             has_subs = len(finfo['subfolder_nids']) > 0
             msg_count = len(finfo['message_nids'])
 
-            # Folder PC
-            pc_data = build_folder_pc(
+            # Folder PC (returns (pages, subnodes))
+            pc_pages, pc_subnodes = build_folder_pc(
                 finfo['name'],
                 content_count=msg_count,
                 has_subfolders=has_subs,
@@ -231,8 +281,8 @@ class PSTFileBuilder:
                     PR_SUBFOLDERS: len(sub_info.get('subfolder_nids', [])) > 0,
                 })
             hier_nid = folder_nid_hierarchy(folder_nid)
-            hier_data = build_hierarchy_tc(sub_rows)
-            hier_bid = self._store_data_block(hier_data)
+            hier_pages, hier_subnodes = build_hierarchy_tc(sub_rows)
+            hier_bid, hier_sub_bid = self._store_tc_or_pc(hier_pages, hier_subnodes)
 
             # Contents TC (message list)
             msg_rows = []
@@ -255,22 +305,23 @@ class PSTFileBuilder:
                     row[PR_MESSAGE_DELIVERY_TIME] = parsed['delivery_time']
                 msg_rows.append(row)
             contents_nid = folder_nid_contents(folder_nid)
-            contents_data = build_contents_tc(msg_rows)
-            contents_bid = self._store_data_block(contents_data)
+            contents_pages, contents_subnodes = build_contents_tc(msg_rows)
+            contents_bid, contents_sub_bid = self._store_tc_or_pc(
+                contents_pages, contents_subnodes)
 
             # Associated Contents TC (empty)
             assoc_nid = folder_nid_assoc(folder_nid)
-            assoc_data = build_assoc_contents_tc()
-            assoc_bid = self._store_data_block(assoc_data)
+            assoc_pages, assoc_subnodes = build_assoc_contents_tc()
+            assoc_bid, assoc_sub_bid = self._store_tc_or_pc(assoc_pages, assoc_subnodes)
 
-            # Add folder PC node (no subnodes — TCs are separate NBT entries)
-            self._add_node(folder_nid, pc_data, sub_bid=0,
+            # Add folder PC node
+            self._add_node(folder_nid, pc_pages, pc_subnodes,
                            parent_nid=finfo['parent_nid'])
 
             # Add 3 TC nodes as separate top-level NBT entries (as Outlook does)
-            self._nodes.append((hier_nid, hier_bid, 0, 0))
-            self._nodes.append((contents_nid, contents_bid, 0, 0))
-            self._nodes.append((assoc_nid, assoc_bid, 0, 0))
+            self._nodes.append((hier_nid, hier_bid, hier_sub_bid, 0))
+            self._nodes.append((contents_nid, contents_bid, contents_sub_bid, 0))
+            self._nodes.append((assoc_nid, assoc_bid, assoc_sub_bid, 0))
 
     def write(self, output_path):
         """Assemble and write the complete PST file.
