@@ -151,7 +151,7 @@ eml2pst/
 | `To` / `Cc` / `Bcc` | Recipients table (NID 0x0692) |
 | `Date` | PR_MESSAGE_DELIVERY_TIME (0x0E06) |
 | text/plain body | PR_BODY (0x1000) |
-| text/html body | PR_HTML (0x1035) |
+| text/html body | PR_BODY_HTML (0x1013) |
 | MIME attachments | Attachment table (NID 0x0671) + per-attachment PCs |
 
 ## Validation

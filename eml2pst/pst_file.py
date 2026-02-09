@@ -15,7 +15,7 @@ from .ndb.btree import (
     build_btree_pages, pack_nbt_entry, pack_bbt_entry,
     PTTYPE_NBT, PTTYPE_BBT, PAGE_SIZE,
 )
-from .ndb.amap import build_amap_page, FIRST_AMAP_OFFSET, compute_amap_free
+from .ndb.amap import build_amap_page, FIRST_AMAP_OFFSET, AMAP_COVERAGE, compute_amap_free
 from .ndb.subnode import build_sl_block
 from .messaging.store import build_message_store, build_name_to_id_map
 from .messaging.folder import (
@@ -42,6 +42,29 @@ from .mapi.properties import (
     make_nid,
 )
 from .ltp.pc import build_pc_node
+
+
+def _skip_amap_pages(offset, size):
+    """Advance offset so [offset, offset+size) doesn't overlap any AMap page.
+
+    AMap pages are at fixed positions: FIRST_AMAP_OFFSET + n * AMAP_COVERAGE.
+    """
+    while True:
+        if offset < FIRST_AMAP_OFFSET:
+            return offset
+        rel = offset - FIRST_AMAP_OFFSET
+        n = rel // AMAP_COVERAGE
+        amap_pos = FIRST_AMAP_OFFSET + n * AMAP_COVERAGE
+        # Check if we overlap with the AMap page at amap_pos
+        if offset < amap_pos + PAGE_SIZE:
+            offset = amap_pos + PAGE_SIZE
+            continue
+        # Check if the item extends into the next AMap page's position
+        next_amap = FIRST_AMAP_OFFSET + (n + 1) * AMAP_COVERAGE
+        if offset + size > next_amap:
+            offset = next_amap + PAGE_SIZE
+            continue
+        return offset
 
 
 class PSTFileBuilder:
@@ -336,12 +359,13 @@ class PSTFileBuilder:
         self._build_folder_nodes()
 
         # Phase 1: Assign file offsets to all data blocks
-        # Layout: [Header 0x4400] [AMap page 512] [data blocks...] [BTree pages...]
-        current_offset = FIRST_AMAP_OFFSET + PAGE_SIZE  # After AMap page
+        # Layout: [Header 0x4400] [AMap pages at fixed intervals] [data blocks...] [BTree pages...]
+        current_offset = FIRST_AMAP_OFFSET + PAGE_SIZE  # After first AMap page
 
         block_positions = {}  # bid -> (offset, raw_size)
         for bid, data in self._data_blocks:
             total = block_total_size(len(data))
+            current_offset = _skip_amap_pages(current_offset, total)
             block_positions[bid] = (current_offset, len(data))
             current_offset += total
 
@@ -370,9 +394,9 @@ class PSTFileBuilder:
         page_offsets = {}  # bid -> offset
 
         def alloc_page_offset(bid):
-            offset = page_offset_cursor[0]
+            offset = _skip_amap_pages(page_offset_cursor[0], PAGE_SIZE)
             page_offsets[bid] = offset
-            page_offset_cursor[0] += PAGE_SIZE
+            page_offset_cursor[0] = offset + PAGE_SIZE
             return offset
 
         nbt_pages = build_btree_pages(
@@ -390,9 +414,8 @@ class PSTFileBuilder:
 
         file_eof = page_offset_cursor[0]
 
-        # Phase 5: Build AMap
+        # Phase 5: Build AMap pages (one per AMAP_COVERAGE region)
         allocated_ranges = []
-        allocated_ranges.append((0, FIRST_AMAP_OFFSET))  # Header area
         for bid, data in self._data_blocks:
             if bid in block_positions:
                 offset, raw_size = block_positions[bid]
@@ -401,24 +424,33 @@ class PSTFileBuilder:
         for _, pg_offset, _ in nbt_pages + bbt_pages:
             allocated_ranges.append((pg_offset, PAGE_SIZE))
 
-        amap_bid = self._alloc_page_bid()
-        amap_page = build_amap_page(
-            allocated_ranges, FIRST_AMAP_OFFSET,
-            FIRST_AMAP_OFFSET, amap_bid
-        )
-        amap_free = compute_amap_free(
-            allocated_ranges, FIRST_AMAP_OFFSET, FIRST_AMAP_OFFSET
-        )
+        num_amaps = max(1, (file_eof - FIRST_AMAP_OFFSET + AMAP_COVERAGE - 1) // AMAP_COVERAGE)
+        amap_pages_list = []  # list of (offset, page_bytes)
+        total_amap_free = 0
+        last_amap_offset = FIRST_AMAP_OFFSET
+
+        for i in range(num_amaps):
+            amap_offset = FIRST_AMAP_OFFSET + i * AMAP_COVERAGE
+            amap_bid = self._alloc_page_bid()
+            page = build_amap_page(
+                allocated_ranges, amap_offset, amap_offset, amap_bid
+            )
+            free = compute_amap_free(
+                allocated_ranges, amap_offset, amap_offset
+            )
+            amap_pages_list.append((amap_offset, page))
+            total_amap_free += free
+            last_amap_offset = amap_offset
 
         # Phase 6: Build header
         root = pack_root(
             file_eof=file_eof,
-            ib_amap_last=FIRST_AMAP_OFFSET,
-            cb_amap_free=amap_free,
+            ib_amap_last=last_amap_offset,
+            cb_amap_free=total_amap_free,
             cb_pmap_free=0,
             bref_nbt=(nbt_root_bid, nbt_root_offset),
             bref_bbt=(bbt_root_bid, bbt_root_offset),
-            f_amap_valid=1,
+            f_amap_valid=2,
         )
 
         header = build_header(
@@ -428,40 +460,31 @@ class PSTFileBuilder:
             unique=1,
         )
 
-        # Phase 7: Write everything to file
+        # Phase 7: Write all items sorted by file offset
         with open(output_path, 'wb') as f:
             # Header (padded to FIRST_AMAP_OFFSET)
             f.write(header)
             f.write(b'\x00' * (FIRST_AMAP_OFFSET - len(header)))
 
-            # AMap page
-            f.write(amap_page)
+            # Collect all items: (offset, data_bytes)
+            write_items = []
+            for amap_offset, amap_data in amap_pages_list:
+                write_items.append((amap_offset, amap_data))
+            for bid, data in self._data_blocks:
+                if bid in block_positions:
+                    offset, _ = block_positions[bid]
+                    packed = pack_block(data, bid, offset)
+                    write_items.append((offset, packed))
+            for pg_bid, pg_offset, pg_data in nbt_pages + bbt_pages:
+                write_items.append((pg_offset, pg_data))
 
-            # Data blocks (in order of offset)
-            sorted_blocks = sorted(
-                [(bid, data) for bid, data in self._data_blocks if bid in block_positions],
-                key=lambda x: block_positions[x[0]][0]
-            )
+            write_items.sort(key=lambda x: x[0])
 
-            expected_offset = FIRST_AMAP_OFFSET + PAGE_SIZE
-            for bid, data in sorted_blocks:
-                offset, _ = block_positions[bid]
+            expected_offset = FIRST_AMAP_OFFSET
+            for offset, data in write_items:
                 if offset > expected_offset:
                     f.write(b'\x00' * (offset - expected_offset))
-                packed = pack_block(data, bid, offset)
-                f.write(packed)
-                expected_offset = offset + len(packed)
-
-            # B-tree pages (in order of offset)
-            all_bt_pages = sorted(
-                nbt_pages + bbt_pages,
-                key=lambda x: x[1]  # sort by offset
-            )
-
-            for pg_bid, pg_offset, pg_data in all_bt_pages:
-                if pg_offset > expected_offset:
-                    f.write(b'\x00' * (pg_offset - expected_offset))
-                f.write(pg_data)
-                expected_offset = pg_offset + len(pg_data)
+                f.write(data)
+                expected_offset = offset + len(data)
 
         return output_path
