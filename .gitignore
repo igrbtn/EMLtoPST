@@ -10,3 +10,9 @@ build/
 venv/
 .env
 *.DS_Store
+
+# local test mailboxes (mail data)
+*.mbox
+mock01/
+administrator/
+admin_unarch/
